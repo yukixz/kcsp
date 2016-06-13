@@ -1,5 +1,4 @@
 {
-  "compact": true,
   "comments": false,
   "plugins": [
     "syntax-async-functions",
