@@ -15,8 +15,7 @@ const responseError = {
 }
 
 async function onConnect(req, sock) {
-    let ip = getIp(req)
-    logger.info(`accept connect: ${req.url}, ip ${ip}`)
+    logger.info(`CONNECT accept: ${req.url}`)
 
     let urlp = url.parse(`http://${req.url}`)
     let rSock = net.createConnection({
@@ -24,49 +23,70 @@ async function onConnect(req, sock) {
         port: urlp.port || 80,
     })
     rSock.on('connect', () => {
-        logger.info(`process connect: ${req.url}`)
+        logger.info(`CONNECT processing: ${req.url}`)
         sock.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         sock.pipe(rSock)
         rSock.pipe(sock)
     })
     rSock.on('error', (err) => {
-        logger.info(`process connect error: ${req.url} ${err}`)
-        sock.end()
-        rSock.end()
+        logger.error([
+            `CONNECT error: ${req.url}`,
+            `error: ${err}`,
+        ].join('\n\t'))
+        sock.destroy()
+        rSock.destroy()
     })
-    sock.on('close', () => rSock.end())
-    rSock.on('close', () => sock.end())
+    sock.on('close', () => rSock.destroy())
+    rSock.on('close', () => sock.destroy())
 }
 
-async function onRequest(req, resp) {
-    let stime = Date.now()
-    let ip = getIp(req)
+async function onRequest(req, res) {
+    if (isGameAPI(req)) {
+        return onAPIRequest(req, res)
+    }
 
+    // Process simple proxy request
+    logger.info(`REQUEST accept: ${req.method}, ${req.url}`)
+    let urlp = url.parse(req.url)
+    let opts = {
+        method: req.method,
+        protocol: urlp.protocol,
+        hostname: urlp.hostname,
+        port: urlp.port,
+        path: urlp.path,
+        headers: removeProxyHeaders(req.headers),
+    }
+
+    let rReq = http.request(opts, (rRes) => {
+        res.writeHead(rRes.statusCode, removeProxyHeaders(rRes.headers))
+        rRes.pipe(res)
+    })
+    rReq.on('error', (err) => {
+        res.socket.destroy()
+    })
+    rReq.on('error', () => res.socket.destroy())
+    req.on('error', () => rReq.socket.destroy())
+    req.pipe(rReq)
+}
+
+async function onAPIRequest(req, res) {
     let chunks = []
     req.on('data', chunk => {
         chunks.push(chunk)
     })
 
     req.on('end', async () => {
-        logger.info(`accept request: ${req.url}, ip ${ip}`)
+        logger.info(`API accept: ${req.url}`)
+        let stime = Date.now()
         let body = Buffer.concat(chunks)
 
         try {
-            let data;
-            if (isGameAPI(req)) {
-                let locked = await db.get('lock')
-                if (locked === 'true') {
-                    throw new Error('unavailable')
-                }
-                let id = getRequestId(req, body)
-                data = await processAPIRequest(req, body, id)
-            } else {
-                data = await processRequest(req, body)
-            }
+            let id = getRequestId(req, body)
+            let data = await makeAPIRequest(req, body, id)
 
-            resp.writeHead(data.statusCode, data.headers)
-            resp.end(data.content)
-            logger.info(`response to: ${req.url}, ip ${ip}`)
+            res.writeHead(data.statusCode, data.headers)
+            res.end(data.content)
+            logger.info(`API response to: ${req.url}`)
         }
         catch(err) {
             let errCode = 500
@@ -81,19 +101,24 @@ async function onRequest(req, resp) {
                     errCode = 403
                     break
             }
-            renderErrorPage(resp, errCode)
+            renderErrorPage(res, errCode)
             logger.error([
-                `response ${errCode}: ${req.url}, ip ${ip}`,
+                `response ${errCode}: ${req.url}`,
                 `error: ${err}`
                 ].join('\n\t'))
         }
 
-        logger.info(`finish request: ${req.url}, ip ${ip}, handled in ${(Date.now() - stime) / 1000}s`)
+        logger.info(`API finish: ${req.url}, handled in ${(Date.now() - stime) / 1000}s`)
     })
 }
 
-async function processAPIRequest(req, body, id) {
-    logger.info(`process request: ${req.url}, id ${id}`)
+async function makeAPIRequest(req, body, id) {
+    logger.info(`API processing: ${req.url}, id ${id}`)
+
+    let locked = await db.get('lock')
+    if (locked === 'true') {
+        throw new Error('unavailable')
+    }
 
     let data = await db.get(id)
     if (data === '__REQUEST__') {
@@ -118,31 +143,31 @@ async function processAPIRequest(req, body, id) {
     }
     else {
         try {
-            logger.info(`requesting: ${req.url}`)
+            logger.info(`API requesting: ${req.url}`)
             db.put(id, '__REQUEST__')
 
             let rr = await makeRequest({
                 method:  req.method,
                 url:     req.url,
                 body:    (body.length > 0) ? body : null,
-                headers: filterHeaders(req.headers),
+                headers: removeProxyHeaders(req.headers),
                 encoding: null,
                 timeout: 180000,
             })
             if (rr.statusCode >= 400) {
                 logger.error([
-                    `request responsed: ${req.url}, code ${rr.statusCode}`,
+                    `API responsed: ${req.url}, code ${rr.statusCode}`,
                     `body: ${body}`,
                     `headers: ${JSON.stringify(req.headers)}`,
                     `response: ${rr.body}`
                 ].join('\n\t'))
             } else {
-                logger.info(`request responsed: ${req.url}, code ${rr.statusCode}`)
+                logger.info(`API responsed: ${req.url}, code ${rr.statusCode}`)
             }
 
             let cacheObj = {
                 statusCode: rr.statusCode,
-                headers:    filterHeaders(rr.headers),
+                headers:    removeProxyHeaders(rr.headers),
                 content:    rr.body,
             }
             db.put(id, JSON.stringify(cacheObj))
@@ -150,7 +175,7 @@ async function processAPIRequest(req, body, id) {
         }
         catch (err) {
             logger.error([
-                `request error: ${req.url}`,
+                `API request error: ${req.url}`,
                 `error: ${err}`,
                 `body: ${body}`,
                 `headers: ${JSON.stringify(req.headers)}`,
@@ -159,34 +184,6 @@ async function processAPIRequest(req, body, id) {
             throw new Error('gone')
         }
     }
-}
-
-async function processRequest(req, body) {
-    logger.info(`process request: ${req.url}`)
-    try {
-        let rr = await makeRequest({
-            method:  req.method,
-            url:     req.url,
-            body:    (body.length > 0) ? body : null,
-            headers: filterHeaders(req.headers),
-            encoding: null,
-        })
-        return {
-            statusCode: rr.statusCode,
-            headers:    filterHeaders(rr.headers),
-            content:    rr.body,
-        }
-    }
-    catch (err) {
-        throw new Error('unavailable')
-    }
-}
-
-function getIp(req) {
-    return req.headers['x-forwarded-for'] ||
-        req.connection.remoteAddress ||
-        req.socket.remoteAddress ||
-        req.connection.socket.remoteAddress
 }
 
 function getRequestId(req, body) {
@@ -217,18 +214,19 @@ function makeRequest(opts) {
     })
 }
 
-function filterHeaders(data) {
-    var headers = {}
-    for (var key in data) {
-        if (key !== 'host' &&
-            key !== 'expect' &&
-            key !== 'connection' &&
-            key !== 'proxy-connection' &&
-            key !== 'content-length' &&
-            key !== 'cache-token') {
-            headers[key] = data[key]
-        }
+function removeProxyHeaders(origin) {
+    let headers = {}
+    for (var key in origin) {
+        headers[key] = origin[key]
     }
+    delete headers['connection']
+    delete headers['proxy-connection']
+    delete headers['proxy-authenticate']
+    delete headers['proxy-authorization']
+    delete headers['host']
+    delete headers['content-length']
+    delete headers['cache-token']
+    delete headers['request-uri']
     return headers
 }
 
