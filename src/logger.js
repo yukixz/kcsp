@@ -8,4 +8,7 @@ import config from './config';
     }
 })();
 
-module.exports = tracer.dailyfile({root: config.logPath});
+module.exports = tracer.dailyfile({
+	root: config.logPath,
+	format: "{{timestamp}} <{{title}}> ({{file}}:{{line}}) {{message}}",
+});
